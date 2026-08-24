@@ -447,6 +447,12 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // wait for any in-flight async copies into host memory (e.g. embd_seq)
+    // before the members owning that memory are destroyed
+    if (sched) {
+        synchronize();
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1584,6 +1590,15 @@ int llama_context::encode(const llama_batch & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
 
+    // wait for any pending async copies into embd_seq issued by a previous
+    // decode/encode before releasing their destination memory - on backends
+    // with async get_tensor (e.g. Metal) the copy may still be in flight and
+    // would otherwise write into freed heap memory
+    // ref: https://github.com/ggml-org/llama.cpp/issues/18310
+    if (!embd_seq.empty()) {
+        synchronize();
+    }
+
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
 
@@ -1929,6 +1944,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
     n_queued_tokens += n_tokens_all;
+
+    // wait for any pending async copies into embd_seq issued by a previous
+    // decode/encode before releasing their destination memory - on backends
+    // with async get_tensor (e.g. Metal) the copy may still be in flight and
+    // would otherwise write into freed heap memory
+    // ref: https://github.com/ggml-org/llama.cpp/issues/18310
+    if (!embd_seq.empty()) {
+        synchronize();
+    }
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
@@ -3531,6 +3555,10 @@ void llama_context::opt_epoch_iter(
         const uint32_t n_tokens_all = balloc->get_n_tokens();
 
         n_queued_tokens += n_tokens_all;
+
+        if (!embd_seq.empty()) {
+            synchronize();
+        }
 
         embd_seq.clear();
 
